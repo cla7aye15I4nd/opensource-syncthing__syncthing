@@ -54,6 +54,8 @@ type apiSrv struct {
 	gzipWriters    sync.Pool
 	seenTracker    *retryAfterTracker
 	notSeenTracker *retryAfterTracker
+	lookups        *accountant
+	announcements  *accountant
 }
 
 type replicator interface {
@@ -94,6 +96,8 @@ func newAPISrv(addr string, cert tls.Certificate, db database, repl replicator, 
 			desiredRate:  desiredUnseenNotFoundRate,
 			currentDelay: notFoundRetryUnknownMaxSeconds / 2,
 		},
+		lookups:       &accountant{rate: 1.0, name: "lookups", cur: make(map[protocol.DeviceID]int)},
+		announcements: &accountant{rate: 1.0 / 60, name: "announcements", cur: make(map[protocol.DeviceID]int)},
 	}
 }
 
@@ -132,6 +136,20 @@ func (s *apiSrv) Serve(ctx context.Context) error {
 	if !debug {
 		srv.ErrorLog = log.New(io.Discard, "", 0)
 	}
+
+	go func() {
+		t := time.NewTicker(5 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				s.announcements.rotate()
+				s.lookups.rotate()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	go func() {
 		<-ctx.Done()
@@ -233,6 +251,14 @@ func (s *apiSrv) handleGET(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	if wait := s.lookups.account(&deviceID); wait > 0 {
+		lookupRequestsTotal.WithLabelValues("limited", country).Inc()
+		retryAfter := max(wait, 60*time.Second)
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())))
+		http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
+		return
+	}
+
 	rec, err := s.db.get(&deviceID)
 	if err != nil {
 		// some sort of internal error
@@ -283,6 +309,11 @@ func (s *apiSrv) handleGET(w http.ResponseWriter, req *http.Request) {
 }
 
 func (s *apiSrv) handlePOST(remoteAddr *net.TCPAddr, w http.ResponseWriter, req *http.Request) {
+	defer func() {
+		io.Copy(io.Discard, req.Body)
+		req.Body.Close()
+	}()
+
 	reqID := req.Context().Value(idKey).(requestID)
 	country := req.Context().Value(countryKey).(string)
 
@@ -292,6 +323,15 @@ func (s *apiSrv) handlePOST(remoteAddr *net.TCPAddr, w http.ResponseWriter, req 
 		announceRequestsTotal.WithLabelValues("no_certificate", country).Inc()
 		w.Header().Set("Retry-After", errorRetryAfterString())
 		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	deviceID := protocol.NewDeviceID(rawCert)
+	if wait := s.announcements.account(&deviceID); wait > 0 {
+		announceRequestsTotal.WithLabelValues("limited", country).Inc()
+		retryAfter := max(wait, 60*time.Second)
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())))
+		http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
 		return
 	}
 
@@ -310,8 +350,6 @@ func (s *apiSrv) handlePOST(remoteAddr *net.TCPAddr, w http.ResponseWriter, req 
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
-
-	deviceID := protocol.NewDeviceID(rawCert)
 
 	addresses := fixupAddresses(remoteAddr, ann.Addresses)
 	if len(addresses) == 0 {
